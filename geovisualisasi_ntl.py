@@ -1,6 +1,6 @@
 """
 Script Analisis Nighttime Light pada Streamlit
-FOKUS PADA VISUALISASI GEOSPASIAL NTL
+FOKUS PADA VISUALISASI GEOSPASIAL NTL DENGAN MASKING BATAS ADMINISTRASI
 Dengan penghilangan blok hitam dan hanya menampilkan pixel terang
 """
 
@@ -16,6 +16,9 @@ import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 import io
+import geopandas as gpd
+from shapely.geometry import mapping
+import fiona
 
 # ----------------------------
 # FUNGSI VISUALISASI GEOSPASIAL
@@ -25,6 +28,78 @@ def create_ntl_colormap():
     """Membuat colormap khusus untuk nighttime lights"""
     colors = ['black', 'darkblue', 'blue', 'cyan', 'yellow', 'white']
     return LinearSegmentedColormap.from_list('ntl_colormap', colors, N=256)
+
+def mask_with_administrative_boundaries(raster_data, raster_transform, raster_crs, admin_shapefile, admin_attribute=None, admin_value=None):
+    """
+    Melakukan masking data raster dengan batas administrasi wilayah
+    
+    Parameters:
+    - raster_data: array raster
+    - raster_transform: transform dari raster
+    - raster_crs: CRS dari raster
+    - admin_shapefile: path ke file shapefile batas administrasi
+    - admin_attribute: atribut untuk filtering (opsional)
+    - admin_value: nilai atribut untuk filtering (opsional)
+    
+    Returns:
+    - masked_data: array raster yang sudah dimasking
+    - admin_bounds: bounds dari wilayah administrasi
+    """
+    try:
+        # Baca shapefile batas administrasi
+        admin_gdf = gpd.read_file(admin_shapefile)
+        
+        # Filter berdasarkan atribut jika diberikan
+        if admin_attribute and admin_value:
+            admin_gdf = admin_gdf[admin_gdf[admin_attribute] == admin_value]
+        
+        # Pastikan CRS sama dengan raster
+        if admin_gdf.crs != raster_crs:
+            admin_gdf = admin_gdf.to_crs(raster_crs)
+        
+        # Dapatkan bounds dari wilayah administrasi
+        admin_bounds = admin_gdf.total_bounds
+        
+        # Buat mask dari geometri administrasi
+        from rasterio import features
+        from rasterio.mask import mask
+        
+        # Convert to geojson-like format
+        shapes = [mapping(geom) for geom in admin_gdf.geometry]
+        
+        # Create temporary file for masked raster
+        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp_raster:
+            # Create profile for output
+            profile = {
+                'driver': 'GTiff',
+                'height': raster_data.shape[0],
+                'width': raster_data.shape[1],
+                'count': 1,
+                'dtype': raster_data.dtype,
+                'crs': raster_crs,
+                'transform': raster_transform,
+            }
+            
+            # Write raster data to temporary file
+            with rasterio.open(tmp_raster.name, 'w', **profile) as dst:
+                dst.write(raster_data, 1)
+            
+            # Perform masking
+            with rasterio.open(tmp_raster.name) as src:
+                out_image, out_transform = mask(src, shapes, crop=False, filled=True)
+                masked_data = out_image[0]
+                
+                # Set area outside mask to NaN
+                masked_data[out_image[0] == src.nodata] = np.nan
+        
+        # Clean up temporary file
+        os.unlink(tmp_raster.name)
+        
+        return masked_data, admin_bounds
+        
+    except Exception as e:
+        st.error(f"Error dalam masking batas administrasi: {str(e)}")
+        return raster_data, None
 
 def remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold=0.1, min_pixel_value=0.01):
     """
@@ -39,7 +114,10 @@ def remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold=0.1, m
     - data_cleaned: array dengan blok hitam dihilangkan dan hanya pixel terang yang ditampilkan
     """
     # Normalisasi data ke range 0-1
-    data_normalized = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
+    if np.nanmax(data) > np.nanmin(data):
+        data_normalized = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
+    else:
+        data_normalized = data
     
     # Buat mask untuk pixel terang
     bright_mask = data_normalized > brightness_threshold
@@ -55,15 +133,25 @@ def remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold=0.1, m
     
     return data_cleaned
 
-def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True, brightness_threshold=0.1):
+def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True, 
+                       brightness_threshold=0.1, admin_shapefile=None, 
+                       admin_attribute=None, admin_value=None):
     """Visualisasi geospasial raster NTL dengan Matplotlib"""
     try:
         with rasterio.open(raster_path) as src:
             data = src.read(1)
             bounds = src.bounds
+            transform = src.transform
+            crs = src.crs
             
             # Handle no data values
             data[data == src.nodata] = np.nan
+            
+            # Lakukan masking dengan batas administrasi jika diberikan
+            if admin_shapefile:
+                data, admin_bounds = mask_with_administrative_boundaries(
+                    data, transform, crs, admin_shapefile, admin_attribute, admin_value
+                )
             
             # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
             if remove_black:
@@ -94,7 +182,9 @@ def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True
         st.error(f"Error dalam visualisasi raster: {str(e)}")
         return None
 
-def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True, brightness_threshold=0.1):
+def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True, 
+                              brightness_threshold=0.1, admin_shapefile=None,
+                              admin_attribute=None, admin_value=None):
     """Membuat peta interaktif dengan Folium untuk data NTL"""
     try:
         if not raster_paths:
@@ -115,15 +205,46 @@ def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True
         folium.TileLayer('OpenStreetMap').add_to(m)
         folium.TileLayer('CartoDB positron').add_to(m)
         
+        # Tambahkan batas administrasi jika diberikan
+        if admin_shapefile:
+            try:
+                admin_gdf = gpd.read_file(admin_shapefile)
+                
+                # Filter berdasarkan atribut jika diberikan
+                if admin_attribute and admin_value:
+                    admin_gdf = admin_gdf[admin_gdf[admin_attribute] == admin_value]
+                
+                # Tambahkan batas administrasi ke peta
+                folium.GeoJson(
+                    admin_gdf,
+                    name='Batas Administrasi',
+                    style_function=lambda x: {
+                        'fillColor': 'none',
+                        'color': 'red',
+                        'weight': 2,
+                        'fillOpacity': 0
+                    }
+                ).add_to(m)
+            except Exception as e:
+                st.warning(f"Tidak dapat menambahkan batas administrasi: {str(e)}")
+        
         # Untuk setiap raster, tambahkan sebagai overlay
         for i, raster_path in enumerate(raster_paths):
             with rasterio.open(raster_path) as src:
                 bounds = src.bounds
+                transform = src.transform
+                crs = src.crs
                 year_label = year_labels[i] if year_labels and i < len(year_labels) else f"Year {i+1}"
                 
                 # Convert raster to PNG untuk overlay
                 data = src.read(1)
                 data[data == src.nodata] = 0
+                
+                # Lakukan masking dengan batas administrasi jika diberikan
+                if admin_shapefile:
+                    data, _ = mask_with_administrative_boundaries(
+                        data, transform, crs, admin_shapefile, admin_attribute, admin_value
+                    )
                 
                 # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
                 if remove_black:
@@ -165,7 +286,9 @@ def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True
         st.error(f"Error membuat peta interaktif: {str(e)}")
         return None
 
-def plot_ntl_comparison(raster_paths, titles=None, remove_black=True, brightness_threshold=0.1):
+def plot_ntl_comparison(raster_paths, titles=None, remove_black=True, 
+                       brightness_threshold=0.1, admin_shapefile=None,
+                       admin_attribute=None, admin_value=None):
     """Plot komparasi multiple NTL raster dalam grid"""
     n_rasters = len(raster_paths)
     n_cols = min(3, n_rasters)
@@ -182,8 +305,16 @@ def plot_ntl_comparison(raster_paths, titles=None, remove_black=True, brightness
         try:
             with rasterio.open(raster_path) as src:
                 data = src.read(1)
+                transform = src.transform
+                crs = src.crs
                 data[data == src.nodata] = np.nan
                 bounds = src.bounds
+                
+                # Lakukan masking dengan batas administrasi jika diberikan
+                if admin_shapefile:
+                    data, _ = mask_with_administrative_boundaries(
+                        data, transform, crs, admin_shapefile, admin_attribute, admin_value
+                    )
                 
                 # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
                 if remove_black:
@@ -214,14 +345,23 @@ def plot_ntl_comparison(raster_paths, titles=None, remove_black=True, brightness
     plt.tight_layout()
     return fig
 
-def generate_ntl_statistics(raster_paths, remove_black=True, brightness_threshold=0.1):
+def generate_ntl_statistics(raster_paths, remove_black=True, brightness_threshold=0.1,
+                           admin_shapefile=None, admin_attribute=None, admin_value=None):
     """Generate statistics untuk data NTL"""
     stats_data = []
     
     for i, path in enumerate(raster_paths):
         with rasterio.open(path) as src:
             data = src.read(1)
+            transform = src.transform
+            crs = src.crs
             data[data == src.nodata] = np.nan
+            
+            # Lakukan masking dengan batas administrasi jika diberikan
+            if admin_shapefile:
+                data, _ = mask_with_administrative_boundaries(
+                    data, transform, crs, admin_shapefile, admin_attribute, admin_value
+                )
             
             # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
             if remove_black:
@@ -256,8 +396,8 @@ def generate_ntl_statistics(raster_paths, remove_black=True, brightness_threshol
 def setup_geospatial_visualization():
     """Setup utama untuk visualisasi geospasial"""
     
-    st.header("🌍 Visualisasi Geospasial Nighttime Lights")
-    st.markdown("Analisis spasial dan temporal data nighttime lights dengan visualisasi interaktif")
+    st.header("🌍 Visualisasi Geospasial Nighttime Lights dengan Masking Administrasi")
+    st.markdown("Analisis spasial dan temporal data nighttime lights dengan masking batas administrasi wilayah")
     
     # Kontrol untuk penghilangan blok hitam
     st.sidebar.header("⚙️ Pengaturan Filter Pixel")
@@ -278,6 +418,68 @@ def setup_geospatial_visualization():
         key="geospatial_upload"
     )
     
+    # Upload shapefile batas administrasi
+    st.sidebar.header("🗺️ Pengaturan Batas Administrasi")
+    admin_files = st.sidebar.file_uploader(
+        "Upload Shapefile Batas Administrasi (.shp + companion files)",
+        type=["shp", "shx", "dbf", "prj"],
+        accept_multiple_files=True,
+        help="Upload semua file shapefile (.shp, .shx, .dbf, .prj)"
+    )
+    
+    admin_attribute = None
+    admin_value = None
+    
+    if admin_files:
+        # Pisahkan file berdasarkan ekstensi
+        shp_file = None
+        companion_files = []
+        
+        for file in admin_files:
+            if file.name.endswith('.shp'):
+                shp_file = file
+            else:
+                companion_files.append(file)
+        
+        if shp_file:
+            # Simpan file shapefile sementara
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Simpan file utama
+                shp_path = os.path.join(tmpdir, shp_file.name)
+                with open(shp_path, "wb") as f:
+                    f.write(shp_file.getbuffer())
+                
+                # Simpan file pendamping
+                for comp_file in companion_files:
+                    comp_path = os.path.join(tmpdir, comp_file.name)
+                    with open(comp_path, "wb") as f:
+                        f.write(comp_file.getbuffer())
+                
+                try:
+                    # Baca shapefile untuk mendapatkan atribut
+                    admin_gdf = gpd.read_file(shp_path)
+                    st.sidebar.success(f"✅ Shapefile berhasil diunggah: {len(admin_gdf)} fitur")
+                    
+                    # Pilih atribut untuk filtering
+                    if not admin_gdf.empty:
+                        attributes = list(admin_gdf.columns)
+                        admin_attribute = st.sidebar.selectbox(
+                            "Pilih atribut untuk filtering",
+                            options=attributes,
+                            index=0
+                        )
+                        
+                        if admin_attribute:
+                            unique_values = admin_gdf[admin_attribute].unique()
+                            admin_value = st.sidebar.selectbox(
+                                "Pilih nilai atribut",
+                                options=unique_values
+                            )
+                
+                except Exception as e:
+                    st.sidebar.error(f"Error membaca shapefile: {str(e)}")
+                    admin_files = None
+    
     if raster_files:
         with tempfile.TemporaryDirectory() as tmpdir:
             raster_paths = []
@@ -287,11 +489,19 @@ def setup_geospatial_visualization():
                     f.write(uploaded_file.getbuffer())
                 raster_paths.append(file_path)
             
+            # Path shapefile sementara jika ada
+            admin_shapefile_path = None
+            if admin_files and shp_file:
+                admin_shapefile_path = shp_path
+            
             st.success(f"✅ {len(raster_paths)} file raster berhasil diunggah")
             
             # Tampilkan informasi filter
             if remove_black_blocks:
                 st.info(f"🔧 Filter aktif: Hanya menampilkan pixel dengan kecerahan di atas {brightness_threshold}")
+            
+            if admin_shapefile_path:
+                st.info(f"🗺️ Masking aktif: Batas administrasi ({admin_attribute}: {admin_value})")
             
             # Kontrol visualisasi
             col1, col2 = st.columns(2)
@@ -305,25 +515,33 @@ def setup_geospatial_visualization():
             
             # Visualisasi berdasarkan pilihan
             if viz_type == "Peta Interaktif":
-                st.subheader("🗺️ Peta Interaktif Nighttime Lights")
+                st.subheader("🗺️ Peta Interaktif Nighttime Lights dengan Batas Administrasi")
                 years = [f"Tahun {2020+i}" for i in range(len(raster_paths))]
-                interactive_map = create_interactive_ntl_map(raster_paths, years, 
-                                                           remove_black_blocks, brightness_threshold)
+                interactive_map = create_interactive_ntl_map(
+                    raster_paths, years, remove_black_blocks, brightness_threshold,
+                    admin_shapefile_path, admin_attribute, admin_value
+                )
                 if interactive_map:
                     st_folium(interactive_map, width=900, height=600)
                 else:
                     st.error("Gagal membuat peta interaktif")
             
             elif viz_type == "Grid Comparison":
-                st.subheader("📊 Perbandingan Multi-Temporal")
+                st.subheader("📊 Perbandingan Multi-Temporal dengan Batas Administrasi")
                 titles = [f"Data {i+1} ({uploaded_file.name})" for i, uploaded_file in enumerate(raster_files)]
-                comp_fig = plot_ntl_comparison(raster_paths, titles, remove_black_blocks, brightness_threshold)
+                comp_fig = plot_ntl_comparison(
+                    raster_paths, titles, remove_black_blocks, brightness_threshold,
+                    admin_shapefile_path, admin_attribute, admin_value
+                )
                 st.pyplot(comp_fig)
             
             elif viz_type == "Analisis Statistik":
-                st.subheader("📈 Statistik Spasial NTL")
+                st.subheader("📈 Statistik Spasial NTL dengan Batas Administrasi")
                 
-                stats_df = generate_ntl_statistics(raster_paths, remove_black_blocks, brightness_threshold)
+                stats_df = generate_ntl_statistics(
+                    raster_paths, remove_black_blocks, brightness_threshold,
+                    admin_shapefile_path, admin_attribute, admin_value
+                )
                 st.dataframe(stats_df.style.format({
                     'Min': '{:.4f}',
                     'Max': '{:.4f}', 
@@ -343,7 +561,16 @@ def setup_geospatial_visualization():
                     for path in raster_paths:
                         with rasterio.open(path) as src:
                             data = src.read(1)
+                            transform = src.transform
+                            crs = src.crs
                             data[data == src.nodata] = np.nan
+                            
+                            # Lakukan masking dengan batas administrasi jika diberikan
+                            if admin_shapefile_path:
+                                data, _ = mask_with_administrative_boundaries(
+                                    data, transform, crs, admin_shapefile_path, admin_attribute, admin_value
+                                )
+                            
                             if remove_black_blocks:
                                 data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
                             metrics_data.append(data)
@@ -370,7 +597,7 @@ def setup_geospatial_visualization():
                     st.pyplot(fig)
             
             elif viz_type == "Single View":
-                st.subheader("🔍 Detail Visualisasi per Dataset")
+                st.subheader("🔍 Detail Visualisasi per Dataset dengan Batas Administrasi")
                 
                 selected_idx = st.selectbox(
                     "Pilih dataset",
@@ -381,9 +608,12 @@ def setup_geospatial_visualization():
                 col1, col2 = st.columns([2, 1])
                 
                 with col1:
-                    fig = plot_geospatial_ntl(raster_paths[selected_idx], 
-                                            f"Nighttime Lights - {raster_files[selected_idx].name}",
-                                            remove_black_blocks, brightness_threshold)
+                    fig = plot_geospatial_ntl(
+                        raster_paths[selected_idx], 
+                        f"Nighttime Lights - {raster_files[selected_idx].name}",
+                        remove_black_blocks, brightness_threshold,
+                        admin_shapefile_path, admin_attribute, admin_value
+                    )
                     if fig:
                         st.pyplot(fig)
                 
@@ -391,7 +621,15 @@ def setup_geospatial_visualization():
                     # Statistik dataset terpilih
                     with rasterio.open(raster_paths[selected_idx]) as src:
                         data = src.read(1)
+                        transform = src.transform
+                        crs = src.crs
                         data[data == src.nodata] = np.nan
+                        
+                        # Lakukan masking dengan batas administrasi jika diberikan
+                        if admin_shapefile_path:
+                            data, _ = mask_with_administrative_boundaries(
+                                data, transform, crs, admin_shapefile_path, admin_attribute, admin_value
+                            )
                         
                         if remove_black_blocks:
                             data_cleaned = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
@@ -428,17 +666,17 @@ def setup_geospatial_visualization():
         st.info("📁 Silakan unggah file TIFF raster NTL untuk memulai visualisasi")
 
 # ----------------------------
-# KONFIGURASI STREAMLIT UTAMA - HANYA VISUALISASI GEOSPASIAL
+# KONFIGURASI STREAMLIT UTAMA
 # ----------------------------
 
 st.set_page_config(
-    page_title="NTL Geospatial Visualization", 
+    page_title="NTL Geospatial Visualization with Administrative Masking", 
     layout="wide",
     page_icon="🌃"
 )
 
 st.title("🌃 Nighttime Lights Geospatial Visualization Tool")
-st.markdown("**Dengan Fitur Penghilangan Blok Hitam dan Filter Pixel Terang**")
+st.markdown("**Dengan Fitur Masking Batas Administrasi dan Filter Pixel Terang**")
 
 # Langsung menampilkan visualisasi geospasial tanpa tabs
 setup_geospatial_visualization()
@@ -447,5 +685,5 @@ setup_geospatial_visualization()
 # INFORMASI DEVELOPER
 # ----------------------------
 st.markdown("---")
-st.markdown("**Nighttime Light (NTL) Geospatial Visualization Tool - Ver 3.0**")
+st.markdown("**Nighttime Light (NTL) Geospatial Visualization Tool - Ver 4.0**")
 st.markdown("**Dikembangkan oleh: Firman Afrianto (NTL Analysis Expert) & Adipandang Yudono (WebGIS NTL Analytics Developer)**")
