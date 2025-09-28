@@ -1,10 +1,11 @@
-# -*- coding: utf-8 -*-
 """
 Script Analisis Nighttime Light pada Streamlit
 FOKUS PADA VISUALISASI GEOSPASIAL NTL
+Dengan penghilangan blok hitam dan hanya menampilkan pixel terang
 """
 
 import streamlit as st
+import cv2
 import numpy as np
 import rasterio
 import matplotlib.pyplot as plt
@@ -14,6 +15,8 @@ import folium
 from streamlit_folium import st_folium
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
+from PIL import Image
+import io
 
 # ----------------------------
 # FUNGSI VISUALISASI GEOSPASIAL
@@ -24,7 +27,57 @@ def create_ntl_colormap():
     colors = ['black', 'darkblue', 'blue', 'cyan', 'yellow', 'white']
     return LinearSegmentedColormap.from_list('ntl_colormap', colors, N=256)
 
-def plot_geospatial_ntl(raster_path, title="Nighttime Lights"):
+def remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold=0.1, min_pixel_value=0.01):
+    """
+    Menghilangkan blok hitam dan hanya mempertahankan pixel terang
+    
+    Parameters:
+    - data: array raster
+    - brightness_threshold: threshold untuk menentukan pixel terang (0-1)
+    - min_pixel_value: nilai minimum absolut untuk dianggap sebagai pixel valid
+    
+    Returns:
+    - data_cleaned: array dengan blok hitam dihilangkan dan hanya pixel terang yang ditampilkan
+    """
+    # Normalisasi data ke range 0-1
+    data_normalized = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
+    
+    # Buat mask untuk pixel terang
+    bright_mask = data_normalized > brightness_threshold
+    
+    # Mask untuk nilai yang valid (bukan NaN dan di atas minimum value)
+    valid_mask = (data > min_pixel_value) & (~np.isnan(data))
+    
+    # Gabungkan mask - hanya pertahankan pixel yang terang DAN valid
+    final_mask = bright_mask & valid_mask
+    
+    # Buat array hasil dengan nilai asli untuk pixel terang, NaN untuk lainnya
+    data_cleaned = np.where(final_mask, data, np.nan)
+    
+    return data_cleaned
+
+def enhance_bright_pixels(data, enhancement_factor=1.5):
+    """
+    Meningkatkan visibilitas pixel terang
+    
+    Parameters:
+    - data: array raster
+    - enhancement_factor: faktor peningkatan brightness
+    
+    Returns:
+    - data_enhanced: array dengan pixel terang yang ditingkatkan
+    """
+    # Normalisasi data
+    data_normalized = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
+    
+    # Terapkan enhancement hanya pada pixel yang tidak NaN
+    mask = ~np.isnan(data)
+    data_enhanced = data.copy()
+    data_enhanced[mask] = data[mask] * enhancement_factor
+    
+    return data_enhanced
+
+def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True, brightness_threshold=0.1):
     """Visualisasi geospasial raster NTL dengan Matplotlib"""
     try:
         with rasterio.open(raster_path) as src:
@@ -33,6 +86,10 @@ def plot_geospatial_ntl(raster_path, title="Nighttime Lights"):
             
             # Handle no data values
             data[data == src.nodata] = np.nan
+            
+            # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
+            if remove_black:
+                data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
             
             fig, ax = plt.subplots(1, 1, figsize=(10, 8))
             
@@ -59,7 +116,7 @@ def plot_geospatial_ntl(raster_path, title="Nighttime Lights"):
         st.error(f"Error dalam visualisasi raster: {str(e)}")
         return None
 
-def create_interactive_ntl_map(raster_paths, year_labels=None):
+def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True, brightness_threshold=0.1):
     """Membuat peta interaktif dengan Folium untuk data NTL"""
     try:
         if not raster_paths:
@@ -90,8 +147,16 @@ def create_interactive_ntl_map(raster_paths, year_labels=None):
                 data = src.read(1)
                 data[data == src.nodata] = 0
                 
+                # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
+                if remove_black:
+                    data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                    data = np.nan_to_num(data)  # Convert NaN to 0 untuk visualisasi
+                
                 # Normalisasi data untuk visualisasi
-                data_norm = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
+                if np.nanmax(data) > np.nanmin(data):
+                    data_norm = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
+                else:
+                    data_norm = data
                 
                 # Simpan sebagai PNG sementara
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
@@ -122,7 +187,7 @@ def create_interactive_ntl_map(raster_paths, year_labels=None):
         st.error(f"Error membuat peta interaktif: {str(e)}")
         return None
 
-def plot_ntl_comparison(raster_paths, titles=None):
+def plot_ntl_comparison(raster_paths, titles=None, remove_black=True, brightness_threshold=0.1):
     """Plot komparasi multiple NTL raster dalam grid"""
     n_rasters = len(raster_paths)
     n_cols = min(3, n_rasters)
@@ -141,6 +206,10 @@ def plot_ntl_comparison(raster_paths, titles=None):
                 data = src.read(1)
                 data[data == src.nodata] = np.nan
                 bounds = src.bounds
+                
+                # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
+                if remove_black:
+                    data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
                 
                 ntl_cmap = create_ntl_colormap()
                 im = ax.imshow(data, cmap=ntl_cmap,
@@ -167,7 +236,7 @@ def plot_ntl_comparison(raster_paths, titles=None):
     plt.tight_layout()
     return fig
 
-def generate_ntl_statistics(raster_paths):
+def generate_ntl_statistics(raster_paths, remove_black=True, brightness_threshold=0.1):
     """Generate statistics untuk data NTL"""
     stats_data = []
     
@@ -176,13 +245,27 @@ def generate_ntl_statistics(raster_paths):
             data = src.read(1)
             data[data == src.nodata] = np.nan
             
+            # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
+            if remove_black:
+                data_cleaned = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                bright_pixel_count = np.sum(~np.isnan(data_cleaned))
+                total_pixel_count = np.sum(~np.isnan(data))
+                bright_pixel_ratio = bright_pixel_count / total_pixel_count if total_pixel_count > 0 else 0
+            else:
+                data_cleaned = data
+                bright_pixel_count = np.sum(data_cleaned > np.nanpercentile(data_cleaned, 90))  # Top 10% sebagai pixel terang
+                total_pixel_count = np.sum(~np.isnan(data_cleaned))
+                bright_pixel_ratio = bright_pixel_count / total_pixel_count if total_pixel_count > 0 else 0
+            
             stats = {
                 'Dataset': f"NTL {i+1}",
-                'Min': np.nanmin(data),
-                'Max': np.nanmax(data),
-                'Mean': np.nanmean(data),
-                'Std': np.nanstd(data),
-                'Area (px)': np.sum(~np.isnan(data))
+                'Min': np.nanmin(data_cleaned),
+                'Max': np.nanmax(data_cleaned),
+                'Mean': np.nanmean(data_cleaned),
+                'Std': np.nanstd(data_cleaned),
+                'Total Area (px)': total_pixel_count,
+                'Bright Area (px)': bright_pixel_count,
+                'Bright Pixel Ratio (%)': bright_pixel_ratio * 100
             }
             stats_data.append(stats)
     
@@ -197,6 +280,21 @@ def setup_geospatial_visualization():
     
     st.header("🌍 Visualisasi Geospasial Nighttime Lights")
     st.markdown("Analisis spasial dan temporal data nighttime lights dengan visualisasi interaktif")
+    
+    # Kontrol untuk penghilangan blok hitam
+    st.sidebar.header("⚙️ Pengaturan Filter Pixel")
+    remove_black_blocks = st.sidebar.checkbox("Hilangkan Blok Hitam", value=True, 
+                                            help="Hanya tampilkan pixel terang saja")
+    
+    brightness_threshold = st.sidebar.slider("Threshold Kecerahan Pixel", 
+                                           min_value=0.0, max_value=1.0, 
+                                           value=0.1, step=0.01,
+                                           help="Nilai threshold untuk menentukan pixel terang (0-1)")
+    
+    enhancement_factor = st.sidebar.slider("Faktor Peningkatan Kecerahan", 
+                                         min_value=1.0, max_value=3.0, 
+                                         value=1.5, step=0.1,
+                                         help="Faktor untuk meningkatkan visibilitas pixel terang")
     
     # Upload data raster
     raster_files = st.file_uploader(
@@ -218,6 +316,10 @@ def setup_geospatial_visualization():
             
             st.success(f"✅ {len(raster_paths)} file raster berhasil diunggah")
             
+            # Tampilkan informasi filter
+            if remove_black_blocks:
+                st.info(f"🔧 Filter aktif: Hanya menampilkan pixel dengan kecerahan di atas {brightness_threshold}")
+            
             # Kontrol visualisasi
             col1, col2 = st.columns(2)
             with col1:
@@ -232,7 +334,8 @@ def setup_geospatial_visualization():
             if viz_type == "Peta Interaktif":
                 st.subheader("🗺️ Peta Interaktif Nighttime Lights")
                 years = [f"Tahun {2020+i}" for i in range(len(raster_paths))]
-                interactive_map = create_interactive_ntl_map(raster_paths, years)
+                interactive_map = create_interactive_ntl_map(raster_paths, years, 
+                                                           remove_black_blocks, brightness_threshold)
                 if interactive_map:
                     st_folium(interactive_map, width=900, height=600)
                 else:
@@ -241,30 +344,42 @@ def setup_geospatial_visualization():
             elif viz_type == "Grid Comparison":
                 st.subheader("📊 Perbandingan Multi-Temporal")
                 titles = [f"Data {i+1} ({uploaded_file.name})" for i, uploaded_file in enumerate(raster_files)]
-                comp_fig = plot_ntl_comparison(raster_paths, titles)
+                comp_fig = plot_ntl_comparison(raster_paths, titles, remove_black_blocks, brightness_threshold)
                 st.pyplot(comp_fig)
             
             elif viz_type == "Analisis Statistik":
                 st.subheader("📈 Statistik Spasial NTL")
                 
-                stats_df = generate_ntl_statistics(raster_paths)
+                stats_df = generate_ntl_statistics(raster_paths, remove_black_blocks, brightness_threshold)
                 st.dataframe(stats_df.style.format({
-                    'Min': '{:.2f}',
-                    'Max': '{:.2f}', 
-                    'Mean': '{:.2f}',
-                    'Std': '{:.2f}'
+                    'Min': '{:.4f}',
+                    'Max': '{:.4f}', 
+                    'Mean': '{:.4f}',
+                    'Std': '{:.4f}',
+                    'Total Area (px)': '{:,}',
+                    'Bright Area (px)': '{:,}',
+                    'Bright Pixel Ratio (%)': '{:.2f}%'
                 }), use_container_width=True)
                 
                 # Visualisasi trend
                 if len(raster_paths) > 1:
                     fig, axes = plt.subplots(2, 2, figsize=(12, 8))
                     
-                    # Data preparation
+                    # Data preparation dengan filter
+                    metrics_data = []
+                    for path in raster_paths:
+                        with rasterio.open(path) as src:
+                            data = src.read(1)
+                            data[data == src.nodata] = np.nan
+                            if remove_black_blocks:
+                                data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                            metrics_data.append(data)
+                    
                     metrics = {
-                        'Mean Radiance': [np.nanmean(rasterio.open(path).read(1)) for path in raster_paths],
-                        'Max Radiance': [np.nanmax(rasterio.open(path).read(1)) for path in raster_paths],
-                        'Illuminated Area': [np.sum(~np.isnan(rasterio.open(path).read(1))) for path in raster_paths],
-                        'Std Dev': [np.nanstd(rasterio.open(path).read(1)) for path in raster_paths]
+                        'Mean Radiance': [np.nanmean(data) for data in metrics_data],
+                        'Max Radiance': [np.nanmax(data) for data in metrics_data],
+                        'Illuminated Area': [np.sum(~np.isnan(data)) for data in metrics_data],
+                        'Std Dev': [np.nanstd(data) for data in metrics_data]
                     }
                     
                     for idx, (title, values) in enumerate(metrics.items()):
@@ -294,7 +409,8 @@ def setup_geospatial_visualization():
                 
                 with col1:
                     fig = plot_geospatial_ntl(raster_paths[selected_idx], 
-                                            f"Nighttime Lights - {raster_files[selected_idx].name}")
+                                            f"Nighttime Lights - {raster_files[selected_idx].name}",
+                                            remove_black_blocks, brightness_threshold)
                     if fig:
                         st.pyplot(fig)
                 
@@ -304,18 +420,36 @@ def setup_geospatial_visualization():
                         data = src.read(1)
                         data[data == src.nodata] = np.nan
                         
-                        st.metric("Radiansi Minimum", f"{np.nanmin(data):.2f}")
-                        st.metric("Radiansi Maksimum", f"{np.nanmax(data):.2f}")
-                        st.metric("Radiansi Rata-rata", f"{np.nanmean(data):.2f}")
-                        st.metric("Area Terang (pixels)", f"{np.sum(~np.isnan(data)):,}")
+                        if remove_black_blocks:
+                            data_cleaned = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                            bright_pixel_count = np.sum(~np.isnan(data_cleaned))
+                            total_pixel_count = np.sum(~np.isnan(data))
+                            bright_ratio = (bright_pixel_count / total_pixel_count * 100) if total_pixel_count > 0 else 0
+                        else:
+                            data_cleaned = data
+                            bright_pixel_count = np.sum(data_cleaned > np.nanpercentile(data_cleaned, 90))
+                            total_pixel_count = np.sum(~np.isnan(data_cleaned))
+                            bright_ratio = (bright_pixel_count / total_pixel_count * 100) if total_pixel_count > 0 else 0
+                        
+                        st.metric("Radiansi Minimum", f"{np.nanmin(data_cleaned):.4f}")
+                        st.metric("Radiansi Maksimum", f"{np.nanmax(data_cleaned):.4f}")
+                        st.metric("Radiansi Rata-rata", f"{np.nanmean(data_cleaned):.4f}")
+                        st.metric("Total Area (pixels)", f"{total_pixel_count:,}")
+                        st.metric("Area Terang (pixels)", f"{bright_pixel_count:,}")
+                        st.metric("Persentase Area Terang", f"{bright_ratio:.2f}%")
                         
                         # Histogram
                         fig_hist, ax_hist = plt.subplots(figsize=(6, 4))
-                        ax_hist.hist(data[~np.isnan(data)].flatten(), bins=50, alpha=0.7, edgecolor='black')
-                        ax_hist.set_xlabel('Radiansi')
-                        ax_hist.set_ylabel('Frekuensi')
-                        ax_hist.set_title('Distribusi Radiansi')
-                        ax_hist.grid(True, alpha=0.3)
+                        valid_data = data_cleaned[~np.isnan(data_cleaned)]
+                        if len(valid_data) > 0:
+                            ax_hist.hist(valid_data.flatten(), bins=50, alpha=0.7, edgecolor='black')
+                            ax_hist.set_xlabel('Radiansi')
+                            ax_hist.set_ylabel('Frekuensi')
+                            ax_hist.set_title('Distribusi Radiansi (Pixel Terang)')
+                            ax_hist.grid(True, alpha=0.3)
+                        else:
+                            ax_hist.text(0.5, 0.5, 'Tidak ada data\nyang memenuhi filter', 
+                                       ha='center', va='center', transform=ax_hist.transAxes)
                         st.pyplot(fig_hist)
     else:
         st.info("📁 Silakan unggah file TIFF raster NTL untuk memulai visualisasi")
@@ -331,6 +465,7 @@ st.set_page_config(
 )
 
 st.title("🌃 Nighttime Lights Geospatial Visualization Tool")
+st.markdown("**Dengan Fitur Penghilangan Blok Hitam dan Filter Pixel Terang**")
 
 # Langsung menampilkan visualisasi geospasial tanpa tabs
 setup_geospatial_visualization()
