@@ -1,6 +1,6 @@
 """
 Script Analisis Nighttime Light pada Streamlit
-FOKUS PADA VISUALISASI GEOSPASIAL NTL DENGAN MASKING BATAS ADMINISTRASI
+FOKUS PADA VISUALISASI GEOSPASIAL NTL
 Dengan penghilangan blok hitam dan hanya menampilkan pixel terang
 """
 
@@ -16,9 +16,6 @@ import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 import io
-import json
-from shapely.geometry import shape, mapping
-import pyproj
 
 # ----------------------------
 # FUNGSI VISUALISASI GEOSPASIAL
@@ -29,135 +26,20 @@ def create_ntl_colormap():
     colors = ['black', 'darkblue', 'blue', 'cyan', 'yellow', 'white']
     return LinearSegmentedColormap.from_list('ntl_colormap', colors, N=256)
 
-def read_geojson_direct(geojson_file):
-    """Membaca GeoJSON langsung tanpa menggunakan Fiona"""
-    try:
-        # Baca konten GeoJSON
-        geojson_content = geojson_file.read().decode('utf-8')
-        geojson_data = json.loads(geojson_content)
-        
-        # Process features
-        features = []
-        for feature in geojson_data['features']:
-            geometry = shape(feature['geometry'])
-            properties = feature.get('properties', {})
-            features.append({'geometry': geometry, **properties})
-        
-        # Create DataFrame manually
-        if features:
-            df = pd.DataFrame(features)
-            return df, None
-        else:
-            return None, "Tidak ada fitur dalam GeoJSON"
-            
-    except Exception as e:
-        return None, f"Error membaca GeoJSON: {str(e)}"
-
-def read_shapefile_direct(shp_file, companion_files):
-    """Membaca shapefile menggunakan temporary files tanpa Fiona issues"""
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Simpan semua file
-            for file in [shp_file] + companion_files:
-                file_path = os.path.join(tmpdir, file.name)
-                with open(file_path, "wb") as f:
-                    f.write(file.getbuffer())
-            
-            # Import geopandas di sini untuk avoid circular imports
-            import geopandas as gpd
-            
-            # Cari file .shp
-            shp_path = None
-            for file in os.listdir(tmpdir):
-                if file.endswith('.shp'):
-                    shp_path = os.path.join(tmpdir, file)
-                    break
-            
-            if shp_path:
-                gdf = gpd.read_file(shp_path)
-                return gdf, None
-            else:
-                return None, "File .shp tidak ditemukan"
-                
-    except Exception as e:
-        return None, f"Error membaca shapefile: {str(e)}"
-
-def mask_with_administrative_boundaries(raster_data, raster_transform, raster_crs, admin_gdf, admin_attribute=None, admin_value=None):
-    """
-    Melakukan masking data raster dengan batas administrasi wilayah
-    """
-    try:
-        # Filter berdasarkan atribut jika diberikan
-        if admin_attribute and admin_value and admin_attribute in admin_gdf.columns:
-            admin_gdf_filtered = admin_gdf[admin_gdf[admin_attribute].astype(str) == str(admin_value)]
-        else:
-            admin_gdf_filtered = admin_gdf
-        
-        # Jika tidak ada data setelah filtering, gunakan semua data
-        if len(admin_gdf_filtered) == 0:
-            st.warning(f"Tidak ada data yang sesuai dengan filter {admin_attribute} = {admin_value}. Menampilkan semua data.")
-            admin_gdf_filtered = admin_gdf
-        
-        # Pastikan CRS sama dengan raster
-        if admin_gdf_filtered.crs != raster_crs:
-            admin_gdf_filtered = admin_gdf_filtered.to_crs(raster_crs)
-        
-        # Buat mask dari geometri administrasi
-        from rasterio.mask import mask
-        
-        # Convert to geojson-like format
-        shapes = [mapping(geom) for geom in admin_gdf_filtered.geometry]
-        
-        # Create temporary file for original raster
-        with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp_raster:
-            # Create profile for output
-            profile = {
-                'driver': 'GTiff',
-                'height': raster_data.shape[0],
-                'width': raster_data.shape[1],
-                'count': 1,
-                'dtype': raster_data.dtype,
-                'crs': raster_crs,
-                'transform': raster_transform,
-            }
-            
-            # Write raster data to temporary file
-            with rasterio.open(tmp_raster.name, 'w', **profile) as dst:
-                dst.write(raster_data, 1)
-            
-            # Perform masking
-            with rasterio.open(tmp_raster.name) as src:
-                try:
-                    out_image, out_transform = mask(src, shapes, crop=False, filled=True)
-                    masked_data = out_image[0]
-                    
-                    # Set area outside mask to NaN
-                    masked_data[out_image[0] == src.nodata] = np.nan
-                except Exception as mask_error:
-                    st.warning(f"Masking tidak berhasil: {mask_error}. Menggunakan data asli.")
-                    masked_data = raster_data
-        
-        # Clean up temporary file
-        try:
-            os.unlink(tmp_raster.name)
-        except:
-            pass
-        
-        return masked_data
-        
-    except Exception as e:
-        st.error(f"Error dalam masking batas administrasi: {str(e)}")
-        return raster_data
-
 def remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold=0.1, min_pixel_value=0.01):
     """
     Menghilangkan blok hitam dan hanya mempertahankan pixel terang
+    
+    Parameters:
+    - data: array raster
+    - brightness_threshold: threshold untuk menentukan pixel terang (0-1)
+    - min_pixel_value: nilai minimum absolut untuk dianggap sebagai pixel valid
+    
+    Returns:
+    - data_cleaned: array dengan blok hitam dihilangkan dan hanya pixel terang yang ditampilkan
     """
     # Normalisasi data ke range 0-1
-    if np.nanmax(data) > np.nanmin(data):
-        data_normalized = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
-    else:
-        data_normalized = data
+    data_normalized = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
     
     # Buat mask untuk pixel terang
     bright_mask = data_normalized > brightness_threshold
@@ -173,205 +55,15 @@ def remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold=0.1, m
     
     return data_cleaned
 
-def save_uploaded_files(uploaded_files, temp_dir):
-    """Menyimpan uploaded files ke temporary directory dan return paths"""
-    saved_paths = []
-    for uploaded_file in uploaded_files:
-        file_path = os.path.join(temp_dir, uploaded_file.name)
-        with open(file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        saved_paths.append(file_path)
-    return saved_paths
-
-def convert_dataframe_to_geodataframe(df):
-    """Convert regular DataFrame to GeoDataFrame"""
-    try:
-        import geopandas as gpd
-        from shapely.geometry import Point, Polygon, MultiPolygon
-        
-        # Cari kolom geometry
-        geometry_col = None
-        for col in df.columns:
-            if hasattr(df[col].iloc[0], 'geom_type'):
-                geometry_col = col
-                break
-        
-        if geometry_col:
-            gdf = gpd.GeoDataFrame(df, geometry=geometry_col, crs="EPSG:4326")
-            return gdf
-        else:
-            # Jika tidak ada geometry column, buat dari scratch (untuk kasus simple)
-            st.warning("Tidak ditemukan kolom geometry, menggunakan bounding box default")
-            return None
-            
-    except Exception as e:
-        st.error(f"Error converting to GeoDataFrame: {e}")
-        return None
-
-def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True, 
-                              brightness_threshold=0.1, admin_gdf=None,
-                              admin_attribute=None, admin_value=None):
-    """Membuat peta interaktif dengan Folium untuk data NTL"""
-    try:
-        if not raster_paths:
-            return None
-            
-        # Gunakan raster pertama untuk center map
-        with rasterio.open(raster_paths[0]) as src:
-            bounds = src.bounds
-            center_lat = (bounds.top + bounds.bottom) / 2
-            center_lon = (bounds.left + bounds.right) / 2
-        
-        # Buat peta dasar
-        m = folium.Map(location=[center_lat, center_lon], 
-                      zoom_start=8, 
-                      tiles='CartoDB dark_matter')
-        
-        # Tambahkan tile layers alternatif
-        folium.TileLayer('OpenStreetMap').add_to(m)
-        folium.TileLayer('CartoDB positron').add_to(m)
-        
-        # Tambahkan batas administrasi jika diberikan
-        if admin_gdf is not None and not admin_gdf.empty:
-            try:
-                # Filter berdasarkan atribut jika diberikan
-                if admin_attribute and admin_value and admin_attribute in admin_gdf.columns:
-                    admin_gdf_filtered = admin_gdf[admin_gdf[admin_attribute].astype(str) == str(admin_value)]
-                else:
-                    admin_gdf_filtered = admin_gdf
-                
-                # Convert to GeoJSON format untuk Folium
-                def convert_to_geojson_dict(gdf):
-                    """Convert GeoDataFrame to GeoJSON dict untuk Folium"""
-                    features = []
-                    for idx, row in gdf.iterrows():
-                        geom = row.geometry
-                        properties = {col: row[col] for col in gdf.columns if col != 'geometry'}
-                        
-                        # Convert geometry to dict
-                        geom_dict = json.loads(gpd.GeoSeries([geom]).to_json())
-                        
-                        feature = {
-                            "type": "Feature",
-                            "geometry": geom_dict['features'][0]['geometry'],
-                            "properties": properties
-                        }
-                        features.append(feature)
-                    
-                    return {"type": "FeatureCollection", "features": features}
-                
-                geojson_dict = convert_to_geojson_dict(admin_gdf_filtered)
-                
-                # Tambahkan batas administrasi ke peta
-                folium.GeoJson(
-                    geojson_dict,
-                    name='Batas Administrasi',
-                    style_function=lambda x: {
-                        'fillColor': 'none',
-                        'color': 'red',
-                        'weight': 2,
-                        'fillOpacity': 0
-                    },
-                    tooltip=folium.GeoJsonTooltip(
-                        fields=[admin_attribute] if admin_attribute and admin_attribute in admin_gdf_filtered.columns else [],
-                        aliases=[admin_attribute] if admin_attribute and admin_attribute in admin_gdf_filtered.columns else []
-                    )
-                ).add_to(m)
-                
-            except Exception as e:
-                st.warning(f"Tidak dapat menambahkan batas administrasi ke peta: {str(e)}")
-        
-        # Untuk setiap raster, tambahkan sebagai overlay
-        for i, raster_path in enumerate(raster_paths):
-            try:
-                with rasterio.open(raster_path) as src:
-                    bounds = src.bounds
-                    data = src.read(1)
-                    
-                    # Handle no data values
-                    data[data == src.nodata] = 0
-                    
-                    # Lakukan masking dengan batas administrasi jika diberikan
-                    if admin_gdf is not None:
-                        data = mask_with_administrative_boundaries(
-                            data, src.transform, src.crs, admin_gdf, admin_attribute, admin_value
-                        )
-                    
-                    # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
-                    if remove_black:
-                        data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
-                    
-                    # Replace NaN dengan 0 untuk visualisasi
-                    data = np.nan_to_num(data)
-                    
-                    # Normalisasi data untuk visualisasi
-                    if np.max(data) > np.min(data):
-                        data_norm = (data - np.min(data)) / (np.max(data) - np.min(data))
-                    else:
-                        data_norm = data
-                    
-                    # Apply colormap
-                    ntl_cmap = create_ntl_colormap()
-                    colored_data = ntl_cmap(data_norm)
-                    
-                    # Simpan sebagai PNG sementara
-                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
-                        plt.imsave(tmp_file.name, colored_data)
-                        
-                        # Add raster overlay ke peta
-                        img_overlay = folium.raster_layers.ImageOverlay(
-                            name=year_labels[i] if year_labels and i < len(year_labels) else f"Year {i+1}",
-                            image=tmp_file.name,
-                            bounds=[[bounds.bottom, bounds.left], [bounds.top, bounds.right]],
-                            opacity=0.7,
-                            interactive=True,
-                            cross_origin=False
-                        ).add_to(m)
-                        
-                        # Clean up temporary file
-                        try:
-                            os.unlink(tmp_file.name)
-                        except:
-                            pass
-                            
-            except Exception as e:
-                st.warning(f"Gagal memproses raster {raster_path}: {str(e)}")
-                continue
-        
-        # Tambahkan layer control
-        folium.LayerControl().add_to(m)
-        
-        # Tambahkan measure control
-        folium.plugins.MeasureControl(position='bottomleft').add_to(m)
-        
-        # Tambahkan fullscreen control
-        folium.plugins.Fullscreen(position='topright').add_to(m)
-        
-        return m
-        
-    except Exception as e:
-        st.error(f"Error membuat peta interaktif: {str(e)}")
-        return None
-
-def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True, 
-                       brightness_threshold=0.1, admin_gdf=None, 
-                       admin_attribute=None, admin_value=None):
+def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True, brightness_threshold=0.1):
     """Visualisasi geospasial raster NTL dengan Matplotlib"""
     try:
         with rasterio.open(raster_path) as src:
             data = src.read(1)
             bounds = src.bounds
-            transform = src.transform
-            crs = src.crs
             
             # Handle no data values
             data[data == src.nodata] = np.nan
-            
-            # Lakukan masking dengan batas administrasi jika diberikan
-            if admin_gdf is not None:
-                data = mask_with_administrative_boundaries(
-                    data, transform, crs, admin_gdf, admin_attribute, admin_value
-                )
             
             # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
             if remove_black:
@@ -402,11 +94,170 @@ def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True
         st.error(f"Error dalam visualisasi raster: {str(e)}")
         return None
 
+def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True, brightness_threshold=0.1):
+    """Membuat peta interaktif dengan Folium untuk data NTL"""
+    try:
+        if not raster_paths:
+            return None
+            
+        # Gunakan raster pertama untuk center map
+        with rasterio.open(raster_paths[0]) as src:
+            bounds = src.bounds
+            center_lat = (bounds.top + bounds.bottom) / 2
+            center_lon = (bounds.left + bounds.right) / 2
+        
+        # Buat peta dasar
+        m = folium.Map(location=[center_lat, center_lon], 
+                      zoom_start=8, 
+                      tiles='CartoDB dark_matter')
+        
+        # Tambahkan tile layers alternatif
+        folium.TileLayer('OpenStreetMap').add_to(m)
+        folium.TileLayer('CartoDB positron').add_to(m)
+        
+        # Untuk setiap raster, tambahkan sebagai overlay
+        for i, raster_path in enumerate(raster_paths):
+            with rasterio.open(raster_path) as src:
+                bounds = src.bounds
+                year_label = year_labels[i] if year_labels and i < len(year_labels) else f"Year {i+1}"
+                
+                # Convert raster to PNG untuk overlay
+                data = src.read(1)
+                data[data == src.nodata] = 0
+                
+                # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
+                if remove_black:
+                    data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                    data = np.nan_to_num(data)  # Convert NaN to 0 untuk visualisasi
+                
+                # Normalisasi data untuk visualisasi
+                if np.nanmax(data) > np.nanmin(data):
+                    data_norm = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
+                else:
+                    data_norm = data
+                
+                # Simpan sebagai PNG sementara
+                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_file:
+                    plt.imsave(tmp_file.name, data_norm, cmap=create_ntl_colormap())
+                    
+                    # Add raster overlay ke peta
+                    img_overlay = folium.raster_layers.ImageOverlay(
+                        name=year_label,
+                        image=tmp_file.name,
+                        bounds=[[bounds.bottom, bounds.left], [bounds.top, bounds.right]],
+                        opacity=0.7,
+                        interactive=True,
+                        cross_origin=False
+                    ).add_to(m)
+        
+        # Tambahkan layer control
+        folium.LayerControl().add_to(m)
+        
+        # Tambahkan measure control
+        folium.plugins.MeasureControl(position='bottomleft').add_to(m)
+        
+        # Tambahkan fullscreen control
+        folium.plugins.Fullscreen(position='topright').add_to(m)
+        
+        return m
+        
+    except Exception as e:
+        st.error(f"Error membuat peta interaktif: {str(e)}")
+        return None
+
+def plot_ntl_comparison(raster_paths, titles=None, remove_black=True, brightness_threshold=0.1):
+    """Plot komparasi multiple NTL raster dalam grid"""
+    n_rasters = len(raster_paths)
+    n_cols = min(3, n_rasters)
+    n_rows = (n_rasters + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 4*n_rows))
+    
+    if n_rasters == 1:
+        axes = np.array([axes])
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    for i, (ax, raster_path) in enumerate(zip(axes.flat, raster_paths)):
+        try:
+            with rasterio.open(raster_path) as src:
+                data = src.read(1)
+                data[data == src.nodata] = np.nan
+                bounds = src.bounds
+                
+                # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
+                if remove_black:
+                    data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                
+                ntl_cmap = create_ntl_colormap()
+                im = ax.imshow(data, cmap=ntl_cmap,
+                              extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
+                
+                title = titles[i] if titles and i < len(titles) else f"NTL {i+1}"
+                ax.set_title(title, fontsize=12)
+                ax.set_xlabel('Longitude')
+                ax.set_ylabel('Latitude')
+                ax.grid(True, alpha=0.3)
+                
+                # Add colorbar untuk setiap subplot
+                plt.colorbar(im, ax=ax, shrink=0.8)
+                
+        except Exception as e:
+            ax.text(0.5, 0.5, f"Error\n{str(e)}", 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title("Error Loading Data")
+    
+    # Sembunyikan axes yang tidak terpakai
+    for j in range(i+1, n_rows*n_cols):
+        axes.flat[j].set_visible(False)
+    
+    plt.tight_layout()
+    return fig
+
+def generate_ntl_statistics(raster_paths, remove_black=True, brightness_threshold=0.1):
+    """Generate statistics untuk data NTL"""
+    stats_data = []
+    
+    for i, path in enumerate(raster_paths):
+        with rasterio.open(path) as src:
+            data = src.read(1)
+            data[data == src.nodata] = np.nan
+            
+            # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
+            if remove_black:
+                data_cleaned = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                bright_pixel_count = np.sum(~np.isnan(data_cleaned))
+                total_pixel_count = np.sum(~np.isnan(data))
+                bright_pixel_ratio = bright_pixel_count / total_pixel_count if total_pixel_count > 0 else 0
+            else:
+                data_cleaned = data
+                bright_pixel_count = np.sum(data_cleaned > np.nanpercentile(data_cleaned, 90))  # Top 10% sebagai pixel terang
+                total_pixel_count = np.sum(~np.isnan(data_cleaned))
+                bright_pixel_ratio = bright_pixel_count / total_pixel_count if total_pixel_count > 0 else 0
+            
+            stats = {
+                'Dataset': f"NTL {i+1}",
+                'Min': np.nanmin(data_cleaned),
+                'Max': np.nanmax(data_cleaned),
+                'Mean': np.nanmean(data_cleaned),
+                'Std': np.nanstd(data_cleaned),
+                'Total Area (px)': total_pixel_count,
+                'Bright Area (px)': bright_pixel_count,
+                'Bright Pixel Ratio (%)': bright_pixel_ratio * 100
+            }
+            stats_data.append(stats)
+    
+    return pd.DataFrame(stats_data)
+
+# ----------------------------
+# FUNGSI UTAMA VISUALISASI GEOSPASIAL
+# ----------------------------
+
 def setup_geospatial_visualization():
     """Setup utama untuk visualisasi geospasial"""
     
-    st.header("🌍 Visualisasi Geospasial Nighttime Lights dengan Masking Administrasi")
-    st.markdown("Analisis spasial dan temporal data nighttime lights dengan masking batas administrasi wilayah")
+    st.header("🌍 Visualisasi Geospasial Nighttime Lights")
+    st.markdown("Analisis spasial dan temporal data nighttime lights dengan visualisasi interaktif")
     
     # Kontrol untuk penghilangan blok hitam
     st.sidebar.header("⚙️ Pengaturan Filter Pixel")
@@ -423,103 +274,18 @@ def setup_geospatial_visualization():
         "Pilih file TIFF raster NTL untuk visualisasi", 
         type=["tif", "tiff"], 
         accept_multiple_files=True,
-        help="Unggah beberapa file raster NTL untuk analisis geospasial"
+        help="Unggah beberapa file raster NTL untuk analisis geospasial",
+        key="geospatial_upload"
     )
     
-    # Upload batas administrasi
-    st.sidebar.header("🗺️ Pengaturan Batas Administrasi")
-    
-    # Pilihan tipe file batas administrasi
-    boundary_file_type = st.sidebar.radio(
-        "Pilih tipe file batas administrasi:",
-        ["Shapefile", "GeoJSON"],
-        help="Pilih format file batas administrasi yang akan diunggah"
-    )
-    
-    # Inisialisasi session state variables
-    if 'admin_gdf' not in st.session_state:
-        st.session_state.admin_gdf = None
-    if 'admin_attribute' not in st.session_state:
-        st.session_state.admin_attribute = None
-    if 'admin_value' not in st.session_state:
-        st.session_state.admin_value = None
-
-    if boundary_file_type == "Shapefile":
-        # Upload shapefile batas administrasi
-        admin_files = st.sidebar.file_uploader(
-            "Upload Shapefile Batas Administrasi (.shp + companion files)",
-            type=["shp", "shx", "dbf", "prj"],
-            accept_multiple_files=True,
-            help="Upload semua file shapefile (.shp, .shx, .dbf, .prj)"
-        )
-        
-        if admin_files:
-            # Pisahkan file berdasarkan ekstensi
-            shp_file = None
-            companion_files = []
-            
-            for file in admin_files:
-                if file.name.endswith('.shp'):
-                    shp_file = file
-                else:
-                    companion_files.append(file)
-            
-            if shp_file and companion_files:
-                admin_gdf, error = read_shapefile_direct(shp_file, companion_files)
-                
-                if error:
-                    st.sidebar.error(error)
-                elif admin_gdf is not None:
-                    st.session_state.admin_gdf = admin_gdf
-                    st.sidebar.success(f"✅ Shapefile berhasil diunggah: {len(admin_gdf)} fitur")
-    
-    else:  # GeoJSON
-        # Upload file GeoJSON
-        geojson_file = st.sidebar.file_uploader(
-            "Upload File GeoJSON Batas Administrasi",
-            type=["geojson", "json"],
-            help="Upload file GeoJSON yang berisi batas administrasi"
-        )
-        
-        if geojson_file:
-            # Baca GeoJSON langsung tanpa Fiona
-            admin_df, error = read_geojson_direct(geojson_file)
-            
-            if error:
-                st.sidebar.error(error)
-            elif admin_df is not None:
-                # Convert to GeoDataFrame
-                import geopandas as gpd
-                admin_gdf = convert_dataframe_to_geodataframe(admin_df)
-                
-                if admin_gdf is not None:
-                    st.session_state.admin_gdf = admin_gdf
-                    st.sidebar.success(f"✅ GeoJSON berhasil diunggah: {len(admin_gdf)} fitur")
-                else:
-                    st.sidebar.warning("Berhasil membaca GeoJSON tetapi tidak dapat mengonversi ke format peta")
-
-    # Tampilkan opsi filtering jika ada data administrasi
-    if st.session_state.admin_gdf is not None and not st.session_state.admin_gdf.empty:
-        attributes = [col for col in st.session_state.admin_gdf.columns if col != 'geometry']
-        
-        if attributes:
-            st.session_state.admin_attribute = st.sidebar.selectbox(
-                "Pilih atribut untuk filtering",
-                options=attributes,
-                index=0
-            )
-            
-            if st.session_state.admin_attribute:
-                unique_values = st.session_state.admin_gdf[st.session_state.admin_attribute].astype(str).unique()
-                st.session_state.admin_value = st.sidebar.selectbox(
-                    "Pilih nilai atribut",
-                    options=unique_values
-                )
-
-    # Proses visualisasi jika ada raster files
     if raster_files:
         with tempfile.TemporaryDirectory() as tmpdir:
-            raster_paths = save_uploaded_files(raster_files, tmpdir)
+            raster_paths = []
+            for i, uploaded_file in enumerate(raster_files):
+                file_path = os.path.join(tmpdir, uploaded_file.name)
+                with open(file_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
+                raster_paths.append(file_path)
             
             st.success(f"✅ {len(raster_paths)} file raster berhasil diunggah")
             
@@ -527,74 +293,160 @@ def setup_geospatial_visualization():
             if remove_black_blocks:
                 st.info(f"🔧 Filter aktif: Hanya menampilkan pixel dengan kecerahan di atas {brightness_threshold}")
             
-            if st.session_state.admin_gdf is not None:
-                filter_info = f"({st.session_state.admin_attribute}: {st.session_state.admin_value})" if st.session_state.admin_attribute and st.session_state.admin_value else "(semua data)"
-                st.info(f"🗺️ Masking aktif: Batas administrasi {filter_info}")
-            
             # Kontrol visualisasi
             col1, col2 = st.columns(2)
             with col1:
                 viz_type = st.selectbox(
                     "Tipe Visualisasi",
-                    ["Peta Interaktif", "Single View"]
+                    ["Peta Interaktif", "Grid Comparison", "Analisis Statistik", "Single View"]
                 )
+            with col2:
+                opacity = st.slider("Opacity Peta", 0.1, 1.0, 0.7)
             
             # Visualisasi berdasarkan pilihan
             if viz_type == "Peta Interaktif":
-                st.subheader("🗺️ Peta Interaktif Nighttime Lights dengan Batas Administrasi")
+                st.subheader("🗺️ Peta Interaktif Nighttime Lights")
                 years = [f"Tahun {2020+i}" for i in range(len(raster_paths))]
-                
-                interactive_map = create_interactive_ntl_map(
-                    raster_paths, 
-                    years, 
-                    remove_black_blocks, 
-                    brightness_threshold,
-                    st.session_state.admin_gdf,
-                    st.session_state.admin_attribute,
-                    st.session_state.admin_value
-                )
-                
+                interactive_map = create_interactive_ntl_map(raster_paths, years, 
+                                                           remove_black_blocks, brightness_threshold)
                 if interactive_map:
                     st_folium(interactive_map, width=900, height=600)
                 else:
                     st.error("Gagal membuat peta interaktif")
+            
+            elif viz_type == "Grid Comparison":
+                st.subheader("📊 Perbandingan Multi-Temporal")
+                titles = [f"Data {i+1} ({uploaded_file.name})" for i, uploaded_file in enumerate(raster_files)]
+                comp_fig = plot_ntl_comparison(raster_paths, titles, remove_black_blocks, brightness_threshold)
+                st.pyplot(comp_fig)
+            
+            elif viz_type == "Analisis Statistik":
+                st.subheader("📈 Statistik Spasial NTL")
+                
+                stats_df = generate_ntl_statistics(raster_paths, remove_black_blocks, brightness_threshold)
+                st.dataframe(stats_df.style.format({
+                    'Min': '{:.4f}',
+                    'Max': '{:.4f}', 
+                    'Mean': '{:.4f}',
+                    'Std': '{:.4f}',
+                    'Total Area (px)': '{:,}',
+                    'Bright Area (px)': '{:,}',
+                    'Bright Pixel Ratio (%)': '{:.2f}%'
+                }), use_container_width=True)
+                
+                # Visualisasi trend
+                if len(raster_paths) > 1:
+                    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
                     
-            elif viz_type == "Single View" and raster_paths:
-                st.subheader("📊 Single View Nighttime Lights")
-                fig = plot_geospatial_ntl(
-                    raster_paths[0],
-                    "Nighttime Lights",
-                    remove_black_blocks,
-                    brightness_threshold,
-                    st.session_state.admin_gdf,
-                    st.session_state.admin_attribute,
-                    st.session_state.admin_value
-                )
-                if fig:
+                    # Data preparation dengan filter
+                    metrics_data = []
+                    for path in raster_paths:
+                        with rasterio.open(path) as src:
+                            data = src.read(1)
+                            data[data == src.nodata] = np.nan
+                            if remove_black_blocks:
+                                data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                            metrics_data.append(data)
+                    
+                    metrics = {
+                        'Mean Radiance': [np.nanmean(data) for data in metrics_data],
+                        'Max Radiance': [np.nanmax(data) for data in metrics_data],
+                        'Illuminated Area': [np.sum(~np.isnan(data)) for data in metrics_data],
+                        'Std Dev': [np.nanstd(data) for data in metrics_data]
+                    }
+                    
+                    for idx, (title, values) in enumerate(metrics.items()):
+                        ax = axes[idx//2, idx%2]
+                        x_range = list(range(len(values)))
+                        ax.plot(x_range, values, 'o-', linewidth=2, markersize=6)
+                        ax.set_title(title)
+                        ax.set_xlabel('Dataset')
+                        ax.set_ylabel('Nilai')
+                        ax.grid(True, alpha=0.3)
+                        ax.set_xticks(x_range)
+                        ax.set_xticklabels([f'DS{i+1}' for i in x_range])
+                    
+                    plt.tight_layout()
                     st.pyplot(fig)
-
+            
+            elif viz_type == "Single View":
+                st.subheader("🔍 Detail Visualisasi per Dataset")
+                
+                selected_idx = st.selectbox(
+                    "Pilih dataset",
+                    options=list(range(len(raster_files))),
+                    format_func=lambda x: f"Dataset {x+1} - {raster_files[x].name}"
+                )
+                
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    fig = plot_geospatial_ntl(raster_paths[selected_idx], 
+                                            f"Nighttime Lights - {raster_files[selected_idx].name}",
+                                            remove_black_blocks, brightness_threshold)
+                    if fig:
+                        st.pyplot(fig)
+                
+                with col2:
+                    # Statistik dataset terpilih
+                    with rasterio.open(raster_paths[selected_idx]) as src:
+                        data = src.read(1)
+                        data[data == src.nodata] = np.nan
+                        
+                        if remove_black_blocks:
+                            data_cleaned = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+                            bright_pixel_count = np.sum(~np.isnan(data_cleaned))
+                            total_pixel_count = np.sum(~np.isnan(data))
+                            bright_ratio = (bright_pixel_count / total_pixel_count * 100) if total_pixel_count > 0 else 0
+                        else:
+                            data_cleaned = data
+                            bright_pixel_count = np.sum(data_cleaned > np.nanpercentile(data_cleaned, 90))
+                            total_pixel_count = np.sum(~np.isnan(data_cleaned))
+                            bright_ratio = (bright_pixel_count / total_pixel_count * 100) if total_pixel_count > 0 else 0
+                        
+                        st.metric("Radiansi Minimum", f"{np.nanmin(data_cleaned):.4f}")
+                        st.metric("Radiansi Maksimum", f"{np.nanmax(data_cleaned):.4f}")
+                        st.metric("Radiansi Rata-rata", f"{np.nanmean(data_cleaned):.4f}")
+                        st.metric("Total Area (pixels)", f"{total_pixel_count:,}")
+                        st.metric("Area Terang (pixels)", f"{bright_pixel_count:,}")
+                        st.metric("Persentase Area Terang", f"{bright_ratio:.2f}%")
+                        
+                        # Histogram
+                        fig_hist, ax_hist = plt.subplots(figsize=(6, 4))
+                        valid_data = data_cleaned[~np.isnan(data_cleaned)]
+                        if len(valid_data) > 0:
+                            ax_hist.hist(valid_data.flatten(), bins=50, alpha=0.7, edgecolor='black')
+                            ax_hist.set_xlabel('Radiansi')
+                            ax_hist.set_ylabel('Frekuensi')
+                            ax_hist.set_title('Distribusi Radiansi (Pixel Terang)')
+                            ax_hist.grid(True, alpha=0.3)
+                        else:
+                            ax_hist.text(0.5, 0.5, 'Tidak ada data\nyang memenuhi filter', 
+                                       ha='center', va='center', transform=ax_hist.transAxes)
+                        st.pyplot(fig_hist)
     else:
         st.info("📁 Silakan unggah file TIFF raster NTL untuk memulai visualisasi")
 
 # ----------------------------
-# KONFIGURASI STREAMLIT UTAMA
+# KONFIGURASI STREAMLIT UTAMA - HANYA VISUALISASI GEOSPASIAL
 # ----------------------------
 
 st.set_page_config(
-    page_title="NTL Geospatial Visualization with Administrative Masking", 
+    page_title="NTL Geospatial Visualization", 
     layout="wide",
     page_icon="🌃"
 )
 
 st.title("🌃 Nighttime Lights Geospatial Visualization Tool")
-st.markdown("**Dengan Fitur Masking Batas Administrasi dan Filter Pixel Terang**")
+st.markdown("**Dengan Fitur Penghilangan Blok Hitam dan Filter Pixel Terang**")
 
-# Langsung menampilkan visualisasi geospasial
+# Langsung menampilkan visualisasi geospasial tanpa tabs
 setup_geospatial_visualization()
 
 # ----------------------------
 # INFORMASI DEVELOPER
 # ----------------------------
 st.markdown("---")
-st.markdown("**Nighttime Light (NTL) Geospatial Visualization Tool - Ver 6.0**")
+st.markdown("**Nighttime Light (NTL) Geospatial Visualization Tool - Ver 3.0**")
 st.markdown("**Dikembangkan oleh: Firman Afrianto (NTL Analysis Expert) & Adipandang Yudono (WebGIS NTL Analytics Developer)**")
+
