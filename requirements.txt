@@ -7,6 +7,4 @@ streamlit-folium==0.15.1
 pandas==1.5.3
 pillow>=9.5.0
 geopandas==0.13.2
-shapely==2.0.1
-fiona==1.9.4
-pyproj==3.6.1
+
