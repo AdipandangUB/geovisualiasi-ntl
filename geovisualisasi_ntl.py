@@ -5,7 +5,6 @@ Dengan penghilangan blok hitam dan hanya menampilkan pixel terang
 """
 
 import streamlit as st
-import cv2
 import numpy as np
 import rasterio
 import matplotlib.pyplot as plt
@@ -55,27 +54,6 @@ def remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold=0.1, m
     data_cleaned = np.where(final_mask, data, np.nan)
     
     return data_cleaned
-
-def enhance_bright_pixels(data, enhancement_factor=1.5):
-    """
-    Meningkatkan visibilitas pixel terang
-    
-    Parameters:
-    - data: array raster
-    - enhancement_factor: faktor peningkatan brightness
-    
-    Returns:
-    - data_enhanced: array dengan pixel terang yang ditingkatkan
-    """
-    # Normalisasi data
-    data_normalized = (data - np.nanmin(data)) / (np.nanmax(data) - np.nanmin(data))
-    
-    # Terapkan enhancement hanya pada pixel yang tidak NaN
-    mask = ~np.isnan(data)
-    data_enhanced = data.copy()
-    data_enhanced[mask] = data[mask] * enhancement_factor
-    
-    return data_enhanced
 
 def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True, brightness_threshold=0.1):
     """Visualisasi geospasial raster NTL dengan Matplotlib"""
@@ -290,11 +268,6 @@ def setup_geospatial_visualization():
                                            min_value=0.0, max_value=1.0, 
                                            value=0.1, step=0.01,
                                            help="Nilai threshold untuk menentukan pixel terang (0-1)")
-    
-    enhancement_factor = st.sidebar.slider("Faktor Peningkatan Kecerahan", 
-                                         min_value=1.0, max_value=3.0, 
-                                         value=1.5, step=0.1,
-                                         help="Faktor untuk meningkatkan visibilitas pixel terang")
     
     # Upload data raster
     raster_files = st.file_uploader(
