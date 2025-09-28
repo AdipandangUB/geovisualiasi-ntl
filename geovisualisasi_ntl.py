@@ -16,9 +16,9 @@ import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
 import io
-import geopandas as gpd
-from shapely.geometry import mapping
 import json
+from shapely.geometry import shape, mapping
+import pyproj
 
 # ----------------------------
 # FUNGSI VISUALISASI GEOSPASIAL
@@ -29,32 +29,84 @@ def create_ntl_colormap():
     colors = ['black', 'darkblue', 'blue', 'cyan', 'yellow', 'white']
     return LinearSegmentedColormap.from_list('ntl_colormap', colors, N=256)
 
-def mask_with_administrative_boundaries(raster_data, raster_transform, raster_crs, admin_boundary_path, admin_attribute=None, admin_value=None):
+def read_geojson_direct(geojson_file):
+    """Membaca GeoJSON langsung tanpa menggunakan Fiona"""
+    try:
+        # Baca konten GeoJSON
+        geojson_content = geojson_file.read().decode('utf-8')
+        geojson_data = json.loads(geojson_content)
+        
+        # Process features
+        features = []
+        for feature in geojson_data['features']:
+            geometry = shape(feature['geometry'])
+            properties = feature.get('properties', {})
+            features.append({'geometry': geometry, **properties})
+        
+        # Create DataFrame manually
+        if features:
+            df = pd.DataFrame(features)
+            return df, None
+        else:
+            return None, "Tidak ada fitur dalam GeoJSON"
+            
+    except Exception as e:
+        return None, f"Error membaca GeoJSON: {str(e)}"
+
+def read_shapefile_direct(shp_file, companion_files):
+    """Membaca shapefile menggunakan temporary files tanpa Fiona issues"""
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Simpan semua file
+            for file in [shp_file] + companion_files:
+                file_path = os.path.join(tmpdir, file.name)
+                with open(file_path, "wb") as f:
+                    f.write(file.getbuffer())
+            
+            # Import geopandas di sini untuk avoid circular imports
+            import geopandas as gpd
+            
+            # Cari file .shp
+            shp_path = None
+            for file in os.listdir(tmpdir):
+                if file.endswith('.shp'):
+                    shp_path = os.path.join(tmpdir, file)
+                    break
+            
+            if shp_path:
+                gdf = gpd.read_file(shp_path)
+                return gdf, None
+            else:
+                return None, "File .shp tidak ditemukan"
+                
+    except Exception as e:
+        return None, f"Error membaca shapefile: {str(e)}"
+
+def mask_with_administrative_boundaries(raster_data, raster_transform, raster_crs, admin_gdf, admin_attribute=None, admin_value=None):
     """
     Melakukan masking data raster dengan batas administrasi wilayah
     """
     try:
-        # Baca file batas administrasi
-        admin_gdf = gpd.read_file(admin_boundary_path)
-        
         # Filter berdasarkan atribut jika diberikan
         if admin_attribute and admin_value and admin_attribute in admin_gdf.columns:
-            admin_gdf = admin_gdf[admin_gdf[admin_attribute].astype(str) == str(admin_value)]
+            admin_gdf_filtered = admin_gdf[admin_gdf[admin_attribute].astype(str) == str(admin_value)]
+        else:
+            admin_gdf_filtered = admin_gdf
         
-        # Jika tidak ada data setelah filtering, tampilkan warning
-        if len(admin_gdf) == 0:
+        # Jika tidak ada data setelah filtering, gunakan semua data
+        if len(admin_gdf_filtered) == 0:
             st.warning(f"Tidak ada data yang sesuai dengan filter {admin_attribute} = {admin_value}. Menampilkan semua data.")
-            admin_gdf = gpd.read_file(admin_boundary_path)
+            admin_gdf_filtered = admin_gdf
         
         # Pastikan CRS sama dengan raster
-        if admin_gdf.crs != raster_crs:
-            admin_gdf = admin_gdf.to_crs(raster_crs)
+        if admin_gdf_filtered.crs != raster_crs:
+            admin_gdf_filtered = admin_gdf_filtered.to_crs(raster_crs)
         
         # Buat mask dari geometri administrasi
         from rasterio.mask import mask
         
         # Convert to geojson-like format
-        shapes = [mapping(geom) for geom in admin_gdf.geometry]
+        shapes = [mapping(geom) for geom in admin_gdf_filtered.geometry]
         
         # Create temporary file for original raster
         with tempfile.NamedTemporaryFile(suffix='.tif', delete=False) as tmp_raster:
@@ -131,87 +183,33 @@ def save_uploaded_files(uploaded_files, temp_dir):
         saved_paths.append(file_path)
     return saved_paths
 
-def process_shapefile_upload(shp_file, companion_files, temp_dir):
-    """Memproses upload shapefile dan return GeoDataFrame"""
+def convert_dataframe_to_geodataframe(df):
+    """Convert regular DataFrame to GeoDataFrame"""
     try:
-        # Simpan semua file shapefile
-        all_files = [shp_file] + companion_files
-        saved_paths = save_uploaded_files(all_files, temp_dir)
+        import geopandas as gpd
+        from shapely.geometry import Point, Polygon, MultiPolygon
         
-        # Cari path ke file .shp
-        shp_path = next((path for path in saved_paths if path.endswith('.shp')), None)
+        # Cari kolom geometry
+        geometry_col = None
+        for col in df.columns:
+            if hasattr(df[col].iloc[0], 'geom_type'):
+                geometry_col = col
+                break
         
-        if shp_path:
-            # Baca shapefile
-            gdf = gpd.read_file(shp_path)
-            return gdf, None, shp_path
+        if geometry_col:
+            gdf = gpd.GeoDataFrame(df, geometry=geometry_col, crs="EPSG:4326")
+            return gdf
         else:
-            return None, "File .shp tidak ditemukan", None
+            # Jika tidak ada geometry column, buat dari scratch (untuk kasus simple)
+            st.warning("Tidak ditemukan kolom geometry, menggunakan bounding box default")
+            return None
             
     except Exception as e:
-        return None, f"Error membaca shapefile: {str(e)}", None
-
-def process_geojson_upload(geojson_file, temp_dir):
-    """Memproses upload GeoJSON dan return GeoDataFrame"""
-    try:
-        saved_paths = save_uploaded_files([geojson_file], temp_dir)
-        geojson_path = saved_paths[0]
-        gdf = gpd.read_file(geojson_path)
-        return gdf, None, geojson_path
-    except Exception as e:
-        return None, f"Error membaca GeoJSON: {str(e)}", None
-
-def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True, 
-                       brightness_threshold=0.1, admin_boundary_path=None, 
-                       admin_attribute=None, admin_value=None):
-    """Visualisasi geospasial raster NTL dengan Matplotlib"""
-    try:
-        with rasterio.open(raster_path) as src:
-            data = src.read(1)
-            bounds = src.bounds
-            transform = src.transform
-            crs = src.crs
-            
-            # Handle no data values
-            data[data == src.nodata] = np.nan
-            
-            # Lakukan masking dengan batas administrasi jika diberikan
-            if admin_boundary_path:
-                data = mask_with_administrative_boundaries(
-                    data, transform, crs, admin_boundary_path, admin_attribute, admin_value
-                )
-            
-            # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
-            if remove_black:
-                data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
-            
-            fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-            
-            # Plot raster dengan colormap khusus NTL
-            ntl_cmap = create_ntl_colormap()
-            im = ax.imshow(data, cmap=ntl_cmap, 
-                          extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
-            
-            ax.set_title(title, fontsize=14, fontweight='bold')
-            ax.set_xlabel('Longitude')
-            ax.set_ylabel('Latitude')
-            
-            # Add colorbar
-            cbar = plt.colorbar(im, ax=ax, shrink=0.6)
-            cbar.set_label('Radiance (nW/cm²/sr)')
-            
-            # Add grid
-            ax.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            return fig
-            
-    except Exception as e:
-        st.error(f"Error dalam visualisasi raster: {str(e)}")
+        st.error(f"Error converting to GeoDataFrame: {e}")
         return None
 
 def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True, 
-                              brightness_threshold=0.1, admin_boundary_path=None,
+                              brightness_threshold=0.1, admin_gdf=None,
                               admin_attribute=None, admin_value=None):
     """Membuat peta interaktif dengan Folium untuk data NTL"""
     try:
@@ -234,27 +232,50 @@ def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True
         folium.TileLayer('CartoDB positron').add_to(m)
         
         # Tambahkan batas administrasi jika diberikan
-        if admin_boundary_path:
+        if admin_gdf is not None and not admin_gdf.empty:
             try:
-                admin_gdf = gpd.read_file(admin_boundary_path)
-                
                 # Filter berdasarkan atribut jika diberikan
                 if admin_attribute and admin_value and admin_attribute in admin_gdf.columns:
-                    admin_gdf = admin_gdf[admin_gdf[admin_attribute].astype(str) == str(admin_value)]
+                    admin_gdf_filtered = admin_gdf[admin_gdf[admin_attribute].astype(str) == str(admin_value)]
+                else:
+                    admin_gdf_filtered = admin_gdf
                 
-                # Konversi ke JSON yang compatible dengan Folium
-                geojson_data = admin_gdf.__geo_interface__
+                # Convert to GeoJSON format untuk Folium
+                def convert_to_geojson_dict(gdf):
+                    """Convert GeoDataFrame to GeoJSON dict untuk Folium"""
+                    features = []
+                    for idx, row in gdf.iterrows():
+                        geom = row.geometry
+                        properties = {col: row[col] for col in gdf.columns if col != 'geometry'}
+                        
+                        # Convert geometry to dict
+                        geom_dict = json.loads(gpd.GeoSeries([geom]).to_json())
+                        
+                        feature = {
+                            "type": "Feature",
+                            "geometry": geom_dict['features'][0]['geometry'],
+                            "properties": properties
+                        }
+                        features.append(feature)
+                    
+                    return {"type": "FeatureCollection", "features": features}
+                
+                geojson_dict = convert_to_geojson_dict(admin_gdf_filtered)
                 
                 # Tambahkan batas administrasi ke peta
                 folium.GeoJson(
-                    geojson_data,
+                    geojson_dict,
                     name='Batas Administrasi',
                     style_function=lambda x: {
                         'fillColor': 'none',
                         'color': 'red',
                         'weight': 2,
                         'fillOpacity': 0
-                    }
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=[admin_attribute] if admin_attribute and admin_attribute in admin_gdf_filtered.columns else [],
+                        aliases=[admin_attribute] if admin_attribute and admin_attribute in admin_gdf_filtered.columns else []
+                    )
                 ).add_to(m)
                 
             except Exception as e:
@@ -271,9 +292,9 @@ def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True
                     data[data == src.nodata] = 0
                     
                     # Lakukan masking dengan batas administrasi jika diberikan
-                    if admin_boundary_path:
+                    if admin_gdf is not None:
                         data = mask_with_administrative_boundaries(
-                            data, src.transform, src.crs, admin_boundary_path, admin_attribute, admin_value
+                            data, src.transform, src.crs, admin_gdf, admin_attribute, admin_value
                         )
                     
                     # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
@@ -307,7 +328,7 @@ def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True
                             cross_origin=False
                         ).add_to(m)
                         
-                        # Clean up temporary file setelah peta dibuat
+                        # Clean up temporary file
                         try:
                             os.unlink(tmp_file.name)
                         except:
@@ -330,6 +351,55 @@ def create_interactive_ntl_map(raster_paths, year_labels=None, remove_black=True
         
     except Exception as e:
         st.error(f"Error membuat peta interaktif: {str(e)}")
+        return None
+
+def plot_geospatial_ntl(raster_path, title="Nighttime Lights", remove_black=True, 
+                       brightness_threshold=0.1, admin_gdf=None, 
+                       admin_attribute=None, admin_value=None):
+    """Visualisasi geospasial raster NTL dengan Matplotlib"""
+    try:
+        with rasterio.open(raster_path) as src:
+            data = src.read(1)
+            bounds = src.bounds
+            transform = src.transform
+            crs = src.crs
+            
+            # Handle no data values
+            data[data == src.nodata] = np.nan
+            
+            # Lakukan masking dengan batas administrasi jika diberikan
+            if admin_gdf is not None:
+                data = mask_with_administrative_boundaries(
+                    data, transform, crs, admin_gdf, admin_attribute, admin_value
+                )
+            
+            # Hapus blok hitam dan pertahankan hanya pixel terang jika diminta
+            if remove_black:
+                data = remove_black_blocks_and_keep_bright_pixels(data, brightness_threshold)
+            
+            fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+            
+            # Plot raster dengan colormap khusus NTL
+            ntl_cmap = create_ntl_colormap()
+            im = ax.imshow(data, cmap=ntl_cmap, 
+                          extent=[bounds.left, bounds.right, bounds.bottom, bounds.top])
+            
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.set_xlabel('Longitude')
+            ax.set_ylabel('Latitude')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, shrink=0.6)
+            cbar.set_label('Radiance (nW/cm²/sr)')
+            
+            # Add grid
+            ax.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            return fig
+            
+    except Exception as e:
+        st.error(f"Error dalam visualisasi raster: {str(e)}")
         return None
 
 def setup_geospatial_visualization():
@@ -369,8 +439,6 @@ def setup_geospatial_visualization():
     # Inisialisasi session state variables
     if 'admin_gdf' not in st.session_state:
         st.session_state.admin_gdf = None
-    if 'admin_boundary_path' not in st.session_state:
-        st.session_state.admin_boundary_path = None
     if 'admin_attribute' not in st.session_state:
         st.session_state.admin_attribute = None
     if 'admin_value' not in st.session_state:
@@ -397,17 +465,13 @@ def setup_geospatial_visualization():
                     companion_files.append(file)
             
             if shp_file and companion_files:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    admin_gdf, error, admin_boundary_path = process_shapefile_upload(
-                        shp_file, companion_files, tmpdir
-                    )
-                    
-                    if error:
-                        st.sidebar.error(error)
-                    elif admin_gdf is not None:
-                        st.session_state.admin_gdf = admin_gdf
-                        st.session_state.admin_boundary_path = admin_boundary_path
-                        st.sidebar.success(f"✅ Shapefile berhasil diunggah: {len(admin_gdf)} fitur")
+                admin_gdf, error = read_shapefile_direct(shp_file, companion_files)
+                
+                if error:
+                    st.sidebar.error(error)
+                elif admin_gdf is not None:
+                    st.session_state.admin_gdf = admin_gdf
+                    st.sidebar.success(f"✅ Shapefile berhasil diunggah: {len(admin_gdf)} fitur")
     
     else:  # GeoJSON
         # Upload file GeoJSON
@@ -418,15 +482,21 @@ def setup_geospatial_visualization():
         )
         
         if geojson_file:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                admin_gdf, error, admin_boundary_path = process_geojson_upload(geojson_file, tmpdir)
+            # Baca GeoJSON langsung tanpa Fiona
+            admin_df, error = read_geojson_direct(geojson_file)
+            
+            if error:
+                st.sidebar.error(error)
+            elif admin_df is not None:
+                # Convert to GeoDataFrame
+                import geopandas as gpd
+                admin_gdf = convert_dataframe_to_geodataframe(admin_df)
                 
-                if error:
-                    st.sidebar.error(error)
-                elif admin_gdf is not None:
+                if admin_gdf is not None:
                     st.session_state.admin_gdf = admin_gdf
-                    st.session_state.admin_boundary_path = admin_boundary_path
                     st.sidebar.success(f"✅ GeoJSON berhasil diunggah: {len(admin_gdf)} fitur")
+                else:
+                    st.sidebar.warning("Berhasil membaca GeoJSON tetapi tidak dapat mengonversi ke format peta")
 
     # Tampilkan opsi filtering jika ada data administrasi
     if st.session_state.admin_gdf is not None and not st.session_state.admin_gdf.empty:
@@ -457,16 +527,16 @@ def setup_geospatial_visualization():
             if remove_black_blocks:
                 st.info(f"🔧 Filter aktif: Hanya menampilkan pixel dengan kecerahan di atas {brightness_threshold}")
             
-            if st.session_state.admin_boundary_path and st.session_state.admin_gdf is not None:
+            if st.session_state.admin_gdf is not None:
                 filter_info = f"({st.session_state.admin_attribute}: {st.session_state.admin_value})" if st.session_state.admin_attribute and st.session_state.admin_value else "(semua data)"
-                st.info(f"🗺️ Masking aktif: Batas administrasi {filter_info} - Format: {boundary_file_type}")
+                st.info(f"🗺️ Masking aktif: Batas administrasi {filter_info}")
             
             # Kontrol visualisasi
             col1, col2 = st.columns(2)
             with col1:
                 viz_type = st.selectbox(
                     "Tipe Visualisasi",
-                    ["Peta Interaktif", "Grid Comparison", "Single View"]
+                    ["Peta Interaktif", "Single View"]
                 )
             
             # Visualisasi berdasarkan pilihan
@@ -479,7 +549,7 @@ def setup_geospatial_visualization():
                     years, 
                     remove_black_blocks, 
                     brightness_threshold,
-                    st.session_state.admin_boundary_path,
+                    st.session_state.admin_gdf,
                     st.session_state.admin_attribute,
                     st.session_state.admin_value
                 )
@@ -496,7 +566,7 @@ def setup_geospatial_visualization():
                     "Nighttime Lights",
                     remove_black_blocks,
                     brightness_threshold,
-                    st.session_state.admin_boundary_path,
+                    st.session_state.admin_gdf,
                     st.session_state.admin_attribute,
                     st.session_state.admin_value
                 )
@@ -526,5 +596,5 @@ setup_geospatial_visualization()
 # INFORMASI DEVELOPER
 # ----------------------------
 st.markdown("---")
-st.markdown("**Nighttime Light (NTL) Geospatial Visualization Tool - Ver 5.2**")
+st.markdown("**Nighttime Light (NTL) Geospatial Visualization Tool - Ver 6.0**")
 st.markdown("**Dikembangkan oleh: Firman Afrianto (NTL Analysis Expert) & Adipandang Yudono (WebGIS NTL Analytics Developer)**")
